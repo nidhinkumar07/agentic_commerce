@@ -11,6 +11,7 @@ approval) before any side effect (like a Razorpay call) happens.
 import sys
 import os
 import sqlite3
+import json
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -21,8 +22,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 import helpers as db
 import gate
 import razorpay_client
+import mandate as mandate_lib
+import webhook_utils
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
 app = FastAPI(title="Agentic Commerce — Merchant Service", version="0.1.0")
@@ -54,6 +57,15 @@ class PurchaseRequest(BaseModel):
     quote_id: str
     agent_id: str
     simulate_razorpay_failure: bool = False  # for the live infra-failure demo only
+    # --- Optional AP2-inspired delegated mandate fields ---
+    # If mandate_id is provided, the request MUST also include a valid
+    # signature over {quote_id, agent_id, amount, mandate_id, signed_at}
+    # (see merchant_service/mandate.py). This is verified BEFORE gate
+    # evaluation and is a strictly additional layer on top of the
+    # existing X-Agent-Secret header check -- not a replacement for it.
+    mandate_id: Optional[str] = None
+    signature: Optional[str] = None
+    signed_at: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +172,46 @@ def purchase(req: PurchaseRequest, x_agent_secret: Optional[str] = Header(None))
             conn.execute("ROLLBACK")
             raise HTTPException(status_code=404, detail=f"quote '{req.quote_id}' not found")
 
+        # --- Optional AP2-inspired delegated mandate verification ---
+        # If the request includes a mandate_id, it must ALSO carry a valid
+        # per-request signature (see mandate.py). This runs BEFORE gate
+        # evaluation -- a request with an invalid/expired/out-of-scope
+        # mandate never reaches spend-cap or stock logic at all. This is
+        # strictly additional to the X-Agent-Secret header check above,
+        # not a replacement for it.
+        if req.mandate_id:
+            if not req.signature or not req.signed_at:
+                conn.execute("ROLLBACK")
+                raise HTTPException(
+                    status_code=400,
+                    detail="mandate_id provided without signature/signed_at",
+                )
+            mandate_result = mandate_lib.verify_purchase_mandate(
+                mandate_id=req.mandate_id,
+                agent_id=req.agent_id,
+                quote_id=req.quote_id,
+                amount=quote["total_price"],
+                signature_hex=req.signature,
+                signed_at=req.signed_at,
+                conn=conn,
+            )
+            # Log the mandate check regardless of outcome -- this is part
+            # of the audit trail's whole point: showing WHY a request was
+            # allowed to even reach the gate, not just the gate's own
+            # decision.
+            db.log_audit(
+                f"mandate_check:{req.quote_id}",
+                "mandate_verification",
+                mandate_result.to_dict(),
+                conn=conn,
+            )
+            if not mandate_result.valid:
+                conn.execute("ROLLBACK")
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"mandate verification failed: {mandate_result.reason}",
+                )
+
         result = gate.evaluate_purchase(quote, agent, conn=conn)
 
         if result.decision == "idempotent_existing":
@@ -201,6 +253,18 @@ def purchase(req: PurchaseRequest, x_agent_secret: Optional[str] = Header(None))
         if not created:
             conn.execute("ROLLBACK")
             return {"idempotent": True, "transaction": txn}
+
+        if req.mandate_id:
+            # Mirror the mandate check onto the real txn_id too, so it
+            # shows up in this transaction's own audit trail (the
+            # standalone mandate_check:<quote_id> entry above is keyed by
+            # quote_id since no txn_id existed yet at verification time).
+            db.log_audit(
+                txn["txn_id"],
+                "mandate_verification",
+                {"valid": True, "reason": "ok", "mandate_id": req.mandate_id},
+                conn=conn,
+            )
 
         txn = db.update_transaction_status(txn["txn_id"], "approved", conn=conn)
         db.log_audit(
@@ -369,3 +433,98 @@ def get_metrics():
         "decline_reasons": decline_reasons,
         "failure_reasons": failure_reasons,
     }
+
+
+# ---------------------------------------------------------------------------
+# Razorpay webhook -- authoritative settlement confirmation
+# ---------------------------------------------------------------------------
+@app.post("/webhooks/razorpay")
+async def razorpay_webhook(request: Request, x_razorpay_signature: Optional[str] = Header(None)):
+    """
+    Genuine production pattern: settlement should be confirmed by
+    Razorpay's own signed webhook, not inferred purely from the
+    synchronous order-creation response. This demo's synchronous path
+    (see /purchase above) remains the PRIMARY way a transaction reaches
+    'completed' or 'failed', for local-demo responsiveness -- Razorpay's
+    real servers can't reach a webhook running on localhost without a
+    public tunnel, which isn't reasonable to require for a quick local
+    demo. This endpoint is a genuine, fully-tested SECONDARY/reconciliation
+    path: if a transaction is still sitting in 'payment_pending' (e.g. the
+    synchronous response itself was lost even though Razorpay actually
+    processed the payment), a real webhook call can still resolve it
+    correctly. In a real production deployment with a public endpoint,
+    this webhook would typically be the ONLY authoritative source of
+    truth, and the synchronous shortcut would be removed entirely.
+
+    Signature verification happens against the RAW request body, before
+    any JSON parsing -- this is required, not optional, since
+    re-serializing parsed JSON is not guaranteed to reproduce the exact
+    bytes Razorpay signed.
+    """
+    raw_body = await request.body()
+    webhook_secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+
+    if not webhook_utils.verify_webhook_signature(raw_body, x_razorpay_signature or "", webhook_secret):
+        raise HTTPException(status_code=401, detail="invalid webhook signature")
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    event = payload.get("event")
+    payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+    razorpay_order_id = payment_entity.get("order_id")
+    razorpay_payment_id = payment_entity.get("id")
+
+    if not razorpay_order_id:
+        raise HTTPException(status_code=400, detail="webhook payload missing payment.entity.order_id")
+
+    txn = db.get_transaction_by_razorpay_order_id(razorpay_order_id)
+    if txn is None:
+        # Not necessarily an error -- could be a webhook for an order this
+        # merchant instance doesn't know about. Acknowledge without acting.
+        return {"status": "ignored", "reason": "no matching transaction"}
+
+    if txn["status"] != "payment_pending":
+        # Already resolved (most likely via the synchronous path). Webhooks
+        # can also arrive more than once by design (Razorpay retries) --
+        # this makes the handler idempotent either way.
+        db.log_audit(
+            txn["txn_id"],
+            "webhook_received_noop",
+            {"event": event, "razorpay_payment_id": razorpay_payment_id, "current_status": txn["status"]},
+        )
+        return {"status": "ignored", "reason": f"transaction already in terminal-ish state: {txn['status']}"}
+
+    if event == "payment.captured":
+        quote = db.get_quote(txn["quote_id"]) if txn.get("quote_id") else None
+        try:
+            if quote:
+                db.decrement_stock(quote["product_id"], quantity=quote["quantity"])
+        except db.StockRaceLostError as e:
+            txn = db.update_transaction_status(txn["txn_id"], "failed", decline_reason="stock_race_lost")
+            db.log_audit(txn["txn_id"], "stock_race_lost", {"error": str(e), "source": "webhook"})
+            return {"status": "processed", "transaction_status": "failed"}
+        txn = db.update_transaction_status(
+            txn["txn_id"], "completed", razorpay_order_id=razorpay_order_id
+        )
+        db.log_audit(
+            txn["txn_id"],
+            "webhook_payment_captured",
+            {"razorpay_payment_id": razorpay_payment_id},
+        )
+        return {"status": "processed", "transaction_status": "completed"}
+
+    elif event == "payment.failed":
+        txn = db.update_transaction_status(txn["txn_id"], "failed", decline_reason="webhook_payment_failed")
+        db.log_audit(
+            txn["txn_id"],
+            "webhook_payment_failed",
+            {"razorpay_payment_id": razorpay_payment_id},
+        )
+        return {"status": "processed", "transaction_status": "failed"}
+
+    else:
+        db.log_audit(txn["txn_id"], "webhook_unhandled_event", {"event": event})
+        return {"status": "ignored", "reason": f"unhandled event type: {event}"}

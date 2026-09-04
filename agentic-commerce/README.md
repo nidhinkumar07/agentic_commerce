@@ -81,6 +81,94 @@ tracking of whether a shown suggestion led to a purchase. Building that
 properly needs an impressions log correlated to subsequent purchases,
 which is a real, scoped piece of future work, not a hidden claim.
 
+## Delegated Payment Authorization (AP2-Inspired Mandates)
+
+The original build only created Razorpay orders — it never modeled how an
+agent's authority to spend actually gets established and proven. This
+section closes that gap with a real, tested, two-layer cryptographic
+signing scheme modeled on the actual architecture of Google's [Agent
+Payments Protocol (AP2)](https://ap2-protocol.org/) — specifically its
+stated core principle, "verifiable intent, not inferred action," via
+signed Mandates — and informed by how Razorpay's own real agentic-payments
+infrastructure (built on **UPI Reserve Pay**, which blocks funds upfront
+and debits as value is delivered) frames consent-based, pre-authorized
+agent spending.
+
+**Two distinct signatures, not one:**
+
+1. **Principal Mandate** (`db/generate_agent_keys.py`, issued once): the
+   human/principal generates an Ed25519 keypair for each buyer agent and
+   signs a binding of `{agent_id, agent's public key, max_amount,
+   currency, expiry}` with their own key. This is stored server-side in
+   the `mandates` table — the merchant trusts its own verified record of
+   this authorization, never a claim the caller makes about itself at
+   request time.
+2. **Per-request agent signature** (checked on every `POST /purchase`
+   that includes a `mandate_id`): the agent signs the *specific* purchase
+   intent — `{quote_id, agent_id, amount, mandate_id, signed_at}` — with
+   its own private key. The merchant verifies this against the
+   `agent_public_key` stored in the matching mandate, checks the mandate
+   isn't expired or revoked, checks the amount is within the mandate's
+   authorized scope, and rejects signed requests older than 5 minutes
+   (replay protection).
+
+This is **strictly additional** to the existing `X-Agent-Secret` header —
+not a replacement. `mandate_id` is optional on `/purchase`; when present,
+every check above runs *before* `gate.evaluate_purchase()` is ever called.
+
+**Real, tested guarantees** (see `tests/test_mandate.py`, 7 tests): a
+signature for one amount can't be replayed onto a different amount or
+quote; a mandate can't authorize more than its own `max_amount`; signing
+with the wrong keypair is rejected; a 10-minute-old signed request is
+rejected even if the signature itself is valid.
+
+**Try it yourself:**
+```bash
+python3 db/generate_agent_keys.py   # prints mandate_id per agent, writes keys to buyer_agent/keys/
+python3 buyer_agent/agent.py --product keyboard --budget 10000 \
+  --agent-id agent_high --agent-secret <printed by seed.py> \
+  --mandate-id <printed above> --agent-key buyer_agent/keys/agent_high.key
+```
+
+**Honest scope statement**: this demonstrates the cryptographic
+delegation *pattern* end-to-end, fully real and independently verifiable
+(Ed25519 signing/verification, no mocked crypto). It does **not** integrate
+with any real bank rail, UPI mandate, or NPCI infrastructure — Reserve
+Pay, UPI Circle, and NPCI's proposed Unified Agent Protocol all require
+banking-partner access this project doesn't have. The gap this closes is
+specifically the one raised in review: showing *how* an agent
+cryptographically proves a delegated payment, not claiming production
+integration with a live payment rail.
+
+## Settlement Confirmation (Webhooks)
+
+The original build treated a successful `client.order.create()` response
+as if it meant the payment was complete — it doesn't. Creating an order
+and a customer actually paying it are different events, and in production
+Razorpay confirms the latter via a signed webhook, not a synchronous
+response to order creation.
+
+`POST /webhooks/razorpay` (see `merchant_service/webhook_utils.py` +
+`main.py`) implements the real pattern: verifies `X-Razorpay-Signature`
+as an HMAC-SHA256 of the **raw** request body (verified before any JSON
+parsing, since re-serializing parsed JSON isn't guaranteed to reproduce
+the exact signed bytes) against `RAZORPAY_WEBHOOK_SECRET`, then processes
+`payment.captured` / `payment.failed` events idempotently — a webhook
+delivered twice (Razorpay retries by design) is a documented no-op the
+second time, not a double stock-decrement.
+
+**Design choice, stated plainly**: the existing synchronous path (order
+created → immediately treated as settled) remains the *primary* way a
+transaction reaches `completed` in this demo, because Razorpay's real
+servers can't reach a webhook on `localhost` without a public tunnel,
+which isn't reasonable to require for a local pitch demo. The webhook is
+a genuine, fully-tested *secondary* reconciliation path — verified with 5
+tests (`tests/test_webhook.py`) covering signature rejection, valid
+processing, idempotent duplicate delivery, and unknown-order handling. In
+a real deployment with a public endpoint, the webhook would typically be
+the *only* authoritative source of truth, and the synchronous shortcut
+would be removed.
+
 ## How to Run
 
 ```bash
@@ -89,7 +177,9 @@ which is a real, scoped piece of future work, not a hidden claim.
 
 This single command creates a virtualenv, installs `requirements.txt`,
 creates `.env` from `.env.example` if missing, seeds the database (safely
-skipped if data already exists), and starts the merchant FastAPI service
+skipped if data already exists), issues delegated-payment mandates for
+each agent (Ed25519 keypairs + signed authorizations — see "Delegated
+Payment Authorization" above), and starts the merchant FastAPI service
 on `http://127.0.0.1:8000`. It then prints two follow-up commands to run
 in separate terminals:
 
@@ -272,6 +362,19 @@ happened):
    8000) to avoid any ambiguity with a real dev server. Verified
    `db/merchant.db`'s transaction count was identical (and zero) before
    and after running the script.
+
+7. **Self-caught — `run.sh` couldn't recover from a corrupted virtual
+   environment.** While testing this session's changes, a partially-deleted
+   `.venv` (directory present, but `.venv/bin/activate` missing) caused
+   `run.sh` to fail with a cryptic `line 30: .venv/bin/activate: No such
+   file or directory` — because the script only checked `[ -d ".venv" ]`,
+   which is true for a corrupted venv just as much as a valid one. **Fix**:
+   check for `.venv/bin/activate` specifically, and if it's missing,
+   `rm -rf .venv` before recreating rather than trying to reuse a broken
+   directory. Verified by deliberately reproducing the exact corrupted
+   state (a `.venv` dir with `bin/activate` removed) and confirming
+   `run.sh` detected it and rebuilt cleanly, then ran end-to-end
+   successfully on the next attempt.
 
 **The two designed failure demos** (both verified live with real output):
 

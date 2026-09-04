@@ -207,6 +207,20 @@ def get_transaction_by_quote_id(quote_id: str, conn: sqlite3.Connection = None) 
             conn.close()
 
 
+def get_transaction_by_razorpay_order_id(razorpay_order_id: str, conn: sqlite3.Connection = None) -> dict | None:
+    """Used by the webhook handler to map an incoming Razorpay event back to our transaction."""
+    own_conn = conn is None
+    conn = conn or get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM transactions WHERE razorpay_order_id = ?", (razorpay_order_id,)
+        ).fetchone()
+        return _row_to_dict(row)
+    finally:
+        if own_conn:
+            conn.close()
+
+
 def get_transaction(txn_id: str, conn: sqlite3.Connection = None) -> dict | None:
     own_conn = conn is None
     conn = conn or get_connection()

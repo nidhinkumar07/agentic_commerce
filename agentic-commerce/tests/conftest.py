@@ -120,3 +120,45 @@ def api_client(helpers, gate, monkeypatch, test_db_path):
 def auth_headers(agent_id: str) -> dict:
     """X-Agent-Secret header for the given test agent_id, for use with api_client."""
     return {"X-Agent-Secret": TEST_AGENT_SECRETS[agent_id]}
+
+
+@pytest.fixture()
+def mandate_setup(helpers, conn):
+    """
+    Generates a real Ed25519 keypair for agent_test_high and a matching
+    active mandate row in the test DB. Returns a dict with mandate_id,
+    agent_private_key_hex, and the mandate's max_amount, for tests to
+    build signed purchase requests against.
+    """
+    import mandate as mandate_lib
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    agent_private_hex, agent_public_hex = mandate_lib.generate_keypair()
+    principal_private_hex, principal_public_hex = mandate_lib.generate_keypair()
+
+    mandate_id = f"mandate_test_{uuid.uuid4().hex[:8]}"
+    issued_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    max_amount = 5000.0
+    currency = "INR"
+
+    signature = mandate_lib.sign_mandate(
+        "agent_test_high", agent_public_hex, max_amount, currency, expires_at, principal_private_hex
+    )
+
+    conn.execute(
+        "INSERT INTO mandates (mandate_id, agent_id, principal_id, agent_public_key, "
+        "principal_public_key, principal_signature, max_amount, currency, issued_at, "
+        "expires_at, revoked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        (mandate_id, "agent_test_high", "test_principal", agent_public_hex, principal_public_hex,
+         signature, max_amount, currency, issued_at, expires_at),
+    )
+    conn.commit()
+
+    return {
+        "mandate_id": mandate_id,
+        "agent_id": "agent_test_high",
+        "agent_private_key_hex": agent_private_hex,
+        "max_amount": max_amount,
+    }

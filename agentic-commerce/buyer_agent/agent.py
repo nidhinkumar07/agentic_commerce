@@ -175,14 +175,49 @@ def request_quote(product_id: str, quantity: int):
     return resp.status_code, resp.json()
 
 
-def request_purchase(quote_id: str, agent_id: str, agent_secret: str, simulate_razorpay_failure: bool = False):
+def request_purchase(
+    quote_id: str,
+    agent_id: str,
+    agent_secret: str,
+    simulate_razorpay_failure: bool = False,
+    mandate_id: str = None,
+    agent_key_path: str = None,
+    amount: float = None,
+):
+    """
+    If mandate_id and agent_key_path are both provided, signs this
+    specific purchase intent (quote_id, agent_id, amount, mandate_id,
+    timestamp) with the agent's own private key before sending -- see
+    merchant_service/mandate.py for what the merchant verifies this
+    against. Requires `amount` (the quote's total_price) since that's
+    part of what gets signed; the merchant independently re-derives the
+    amount from its own quote record and rejects if it doesn't match
+    what was signed, so this CLI can't under-report an amount to itself.
+    """
+    body = {
+        "quote_id": quote_id,
+        "agent_id": agent_id,
+        "simulate_razorpay_failure": simulate_razorpay_failure,
+    }
+
+    if mandate_id and agent_key_path:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "merchant_service"))
+        import mandate as mandate_lib
+
+        with open(agent_key_path, "r") as f:
+            agent_private_key_hex = f.read().strip()
+
+        signature, signed_at = mandate_lib.sign_purchase_request(
+            quote_id, agent_id, amount, mandate_id, agent_private_key_hex
+        )
+        body["mandate_id"] = mandate_id
+        body["signature"] = signature
+        body["signed_at"] = signed_at
+        print(f"[buyer_agent] Signed purchase intent with agent private key (mandate_id={mandate_id})")
+
     resp = requests.post(
         f"{MERCHANT_API_BASE_URL}/purchase",
-        json={
-            "quote_id": quote_id,
-            "agent_id": agent_id,
-            "simulate_razorpay_failure": simulate_razorpay_failure,
-        },
+        json=body,
         headers={"X-Agent-Secret": agent_secret},
         timeout=10,
     )
@@ -226,6 +261,16 @@ def build_parser():
         action="store_true",
         help="Force the merchant to simulate a Razorpay infra failure for this purchase",
     )
+    parser.add_argument(
+        "--mandate-id",
+        help="AP2-inspired delegated mandate ID (printed by db/generate_agent_keys.py). "
+             "If provided, --agent-key is also required.",
+    )
+    parser.add_argument(
+        "--agent-key",
+        help="Path to this agent's Ed25519 private key file (e.g. buyer_agent/keys/agent_high.key), "
+             "used to sign the purchase request when --mandate-id is provided.",
+    )
     return parser
 
 
@@ -254,9 +299,17 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    if bool(args.mandate_id) != bool(args.agent_key):
+        print("[buyer_agent] --mandate-id and --agent-key must be provided together, or not at all.")
+        sys.exit(1)
+
     # --- Idempotency demo path: skip catalog/quote, just re-fire /purchase ---
     if args.repeat:
         print(f"[buyer_agent] Re-submitting /purchase for existing quote_id={args.repeat} (idempotency demo)")
+        # Note: re-signing for --repeat would need the original amount; since
+        # this path exists purely to demonstrate idempotency (the merchant
+        # returns the existing transaction regardless), it intentionally
+        # does not re-attach a mandate signature.
         status_code, body = request_purchase(args.repeat, args.agent_id, args.agent_secret)
         print(f"[buyer_agent] HTTP {status_code}")
         if status_code >= 400:
@@ -314,7 +367,13 @@ def main():
 
     print(f"[buyer_agent] Requesting purchase as agent_id={args.agent_id} ...")
     status_code, body = request_purchase(
-        quote["quote_id"], args.agent_id, args.agent_secret, simulate_razorpay_failure=args.simulate_razorpay_failure
+        quote["quote_id"],
+        args.agent_id,
+        args.agent_secret,
+        simulate_razorpay_failure=args.simulate_razorpay_failure,
+        mandate_id=args.mandate_id,
+        agent_key_path=args.agent_key,
+        amount=quote["total_price"],
     )
     if status_code >= 400:
         print(f"[buyer_agent] Purchase request failed: HTTP {status_code} — {body}")

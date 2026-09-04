@@ -19,18 +19,22 @@ echo "=== Agentic Commerce Demo — startup ==="
 echo ""
 
 # --- 1. venv setup ---
-if [ ! -d ".venv" ]; then
-    echo "[1/4] Creating virtual environment (.venv)..."
+# Check for the activate script specifically, not just the directory --
+# a .venv left over from an interrupted/corrupted previous run can exist
+# as a directory without being a valid, usable venv.
+if [ ! -f ".venv/bin/activate" ]; then
+    echo "[1/5] Creating virtual environment (.venv)..."
+    rm -rf .venv  # clear out any partial/corrupted venv first
     python3 -m venv .venv
 else
-    echo "[1/4] Virtual environment already exists — reusing .venv"
+    echo "[1/5] Virtual environment already exists — reusing .venv"
 fi
 
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
 # --- 2. install requirements ---
-echo "[2/4] Installing requirements.txt..."
+echo "[2/5] Installing requirements.txt..."
 pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
 
@@ -44,20 +48,29 @@ if [ ! -f ".env" ]; then
 fi
 
 # --- 4. seed DB if missing ---
-echo "[3/4] Seeding database (skipped automatically if data already exists)..."
+echo "[3/5] Seeding database (skipped automatically if data already exists)..."
 python3 db/seed.py
 
-# --- 5. start the merchant FastAPI service ---
-echo "[4/4] Starting merchant service on http://127.0.0.1:8000 ..."
+# --- 5. issue delegated-payment mandates (skipped if already present) ---
+echo "[4/5] Setting up delegated-payment mandates (Ed25519 keys + signed authorizations)..."
+python3 db/generate_agent_keys.py
+
+# --- 6. start the merchant FastAPI service ---
+echo "[5/5] Starting merchant service on http://127.0.0.1:8000 ..."
 echo ""
 echo "======================================================================"
 echo " Merchant service starting now (this terminal will stay attached to it)."
 echo ""
 echo " In TWO SEPARATE terminals, run:"
 echo ""
-echo "   1) Buyer agent CLI (example):"
+echo "   1) Buyer agent CLI (example -- secrets/mandate IDs printed above):"
 echo "      source .venv/bin/activate"
-echo "      python3 buyer_agent/agent.py --product keyboard --budget 10000 --agent-id agent_high"
+echo "      python3 buyer_agent/agent.py --product keyboard --budget 10000 \\"
+echo "        --agent-id agent_high --agent-secret <secret from above>"
+echo ""
+echo "      Add cryptographic mandate signing (optional, see README"
+echo "      'Delegated Payment Authorization'):"
+echo "        --mandate-id <mandate_id from above> --agent-key buyer_agent/keys/agent_high.key"
 echo ""
 echo "   2) Streamlit dashboard:"
 echo "      source .venv/bin/activate"
