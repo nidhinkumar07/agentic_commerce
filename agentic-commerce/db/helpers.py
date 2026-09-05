@@ -343,6 +343,124 @@ def list_transactions(status: str = None, conn: sqlite3.Connection = None) -> li
             conn.close()
 
 
+def list_mandates(agent_id: str = None, conn: sqlite3.Connection = None) -> list[dict]:
+    """
+    Lists delegated-payment mandates (see merchant_service/mandate.py).
+    Deliberately excludes agent_public_key/principal_public_key/
+    principal_signature from nothing -- those are not secret (public keys
+    and signatures are, by definition, safe to disclose) and are included
+    so a caller (e.g. the dashboard) can show real verification material,
+    not just metadata. The AGENT PRIVATE KEY is never stored in this table
+    at all, so there's nothing sensitive here to accidentally leak.
+    """
+    own_conn = conn is None
+    conn = conn or get_connection()
+    try:
+        if agent_id:
+            rows = conn.execute(
+                "SELECT * FROM mandates WHERE agent_id = ? ORDER BY issued_at DESC", (agent_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM mandates ORDER BY issued_at DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def log_mandate_attempt(
+    mandate_id: str,
+    agent_id: str,
+    quote_id: str,
+    amount: float,
+    valid: bool,
+    reason: str,
+    signature: str,
+    signed_at: str,
+    txn_id: str = None,
+    conn: sqlite3.Connection = None,
+) -> dict:
+    """
+    Persists one mandate-signed purchase attempt, success or failure.
+    Deliberately a separate table from audit_log (see schema.sql) so that
+    a FAILED attempt -- which happens inside main.py's BEGIN IMMEDIATE
+    block, before any transaction row exists -- still survives even when
+    the caller commits this row and then aborts the rest of the request.
+    Stores the full signature; masking it for display is the dashboard's
+    job (see dashboard/api_client.mask_signature), not this layer's --
+    the merchant needs the real value to have verified it in the first
+    place, and truncating at rest would make this row useless as an
+    actual audit record.
+    """
+    own_conn = conn is None
+    conn = conn or get_connection()
+    try:
+        ts = _now_iso()
+        conn.execute(
+            """INSERT INTO mandate_attempts
+               (mandate_id, agent_id, quote_id, txn_id, amount, valid, reason, signature, signed_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (mandate_id, agent_id, quote_id, txn_id, amount, 1 if valid else 0, reason, signature, signed_at, ts),
+        )
+        if own_conn:
+            conn.commit()
+        row = conn.execute(
+            "SELECT * FROM mandate_attempts WHERE attempt_id = last_insert_rowid()"
+        ).fetchone()
+        return dict(row)
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def link_mandate_attempt_txn(mandate_id: str, quote_id: str, signed_at: str, txn_id: str, conn: sqlite3.Connection = None) -> None:
+    """Back-fills txn_id onto an already-inserted mandate_attempts row once
+    the real transaction is created (it doesn't exist yet at verification
+    time). Matched on (mandate_id, quote_id, signed_at), which together
+    are unique per real request -- signed_at is generated fresh per
+    signing call, so even a retried request with the same quote_id won't
+    collide."""
+    own_conn = conn is None
+    conn = conn or get_connection()
+    try:
+        conn.execute(
+            "UPDATE mandate_attempts SET txn_id = ? WHERE mandate_id = ? AND quote_id = ? AND signed_at = ?",
+            (txn_id, mandate_id, quote_id, signed_at),
+        )
+        if own_conn:
+            conn.commit()
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def list_mandate_attempts(
+    agent_id: str = None, mandate_id: str = None, valid: bool = None, conn: sqlite3.Connection = None
+) -> list[dict]:
+    own_conn = conn is None
+    conn = conn or get_connection()
+    try:
+        query = "SELECT * FROM mandate_attempts WHERE 1=1"
+        params: list = []
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        if mandate_id:
+            query += " AND mandate_id = ?"
+            params.append(mandate_id)
+        if valid is not None:
+            query += " AND valid = ?"
+            params.append(1 if valid else 0)
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        if own_conn:
+            conn.close()
+
+
 def get_agent_daily_spend(agent_id: str, conn: sqlite3.Connection = None) -> float:
     """
     Sum of `completed` + `payment_pending` amounts for this agent, for

@@ -13,6 +13,8 @@ Run with:
 import os
 import sys
 
+from datetime import datetime, timezone
+
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -43,6 +45,20 @@ def render_status_badge(container, status: str):
     container.badge(status or "unknown", color=color)
 
 
+def mandate_is_usable(m: dict) -> bool:
+    """Client-side convenience filter only -- purely so the picker doesn't
+    offer obviously-dead mandates. The merchant's mandate.py re-checks
+    revocation/expiry/scope server-side regardless, so this is not a
+    security boundary, just UX."""
+    if m.get("revoked"):
+        return False
+    try:
+        expires = datetime.strptime(m["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, KeyError, TypeError):
+        return False
+    return datetime.now(timezone.utc) < expires
+
+
 def looks_like_txn_id(value: str) -> bool:
     """Loose format check so garbage input gets a helpful message instead
     of just a bare 404 -- txn_ids are always 'txn_' + a hex suffix."""
@@ -71,8 +87,8 @@ if auto_refresh:
         "terminal (e.g. the buyer agent CLI) show up here without manual interaction."
     )
 
-tab_catalog, tab_run_agent, tab_transactions, tab_audit, tab_metrics = st.tabs(
-    ["📦 Catalog", "▶️ Run Agent", "💳 Transactions", "🔍 Audit Trail", "📈 Growth Metrics"]
+tab_catalog, tab_run_agent, tab_mandates, tab_transactions, tab_audit, tab_metrics = st.tabs(
+    ["📦 Catalog", "▶️ Run Agent", "🔐 Mandates", "💳 Transactions", "🔍 Audit Trail", "📈 Growth Metrics"]
 )
 
 # ---------------------------------------------------------------------------
@@ -116,7 +132,7 @@ with tab_run_agent:
     preset_confirm = st.checkbox(
         "I understand the preset buttons below will fire a real purchase request", key="preset_confirm"
     )
-    preset_cols = st.columns(2)
+    preset_cols = st.columns(3)
 
     if preset_cols[0].button(
         "🚫 Run Policy-Failure Demo", use_container_width=True, disabled=not preset_confirm
@@ -142,6 +158,34 @@ with tab_run_agent:
         st.session_state["last_run_result"] = result
         st.rerun()
 
+    if preset_cols[2].button(
+        "🔐 Run Mandate-Signed Demo", use_container_width=True, disabled=not preset_confirm
+    ):
+        try:
+            mandates = [m for m in api.get_mandates("agent_high") if mandate_is_usable(m)]
+        except Exception as e:
+            mandates = []
+            st.session_state["last_run_result"] = {
+                "stage": "quote",
+                "status_code": 0,
+                "body": f"Could not load mandates: {e}",
+            }
+        if mandates and api.has_local_agent_key("agent_high"):
+            result = api.run_agent_flow(
+                product_id="prod_001",  # keyboard, well within agent_high's mandate scope
+                quantity=1,
+                agent_id="agent_high",
+                mandate_id=mandates[0]["mandate_id"],
+            )
+            st.session_state["last_run_result"] = result
+        elif "last_run_result" not in st.session_state:
+            st.session_state["last_run_result"] = {
+                "stage": "quote",
+                "status_code": 0,
+                "body": "No usable mandate/key found for agent_high — run db/generate_agent_keys.py first.",
+            }
+        st.rerun()
+
     st.divider()
     st.markdown("**Custom run:**")
 
@@ -161,9 +205,48 @@ with tab_run_agent:
             related_desc = ", ".join(f"{r['name']} ({r['product_id']})" for r in related)
             st.caption(f"🔗 You might also consider: {related_desc}")
 
+    # Mandate picker lives outside the form so selecting an agent immediately
+    # refreshes which of that agent's mandates are offered -- Streamlit forms
+    # don't rerun on widget change until submit, which would otherwise let a
+    # stale agent/mandate pairing sit in the UI.
+    agent_id = st.selectbox("Agent", ["agent_high", "agent_low"], key="custom_run_agent")
+
+    try:
+        agent_mandates = api.get_mandates(agent_id)
+    except Exception:
+        agent_mandates = []
+    usable_mandates = [m for m in agent_mandates if mandate_is_usable(m)]
+
+    use_mandate = st.checkbox(
+        "🔐 Sign with delegated mandate (Ed25519)",
+        key="use_mandate",
+        disabled=not usable_mandates,
+        help=(
+            "Requires an unrevoked, unexpired mandate for this agent (see the 🔐 Mandates tab) "
+            "and its private key on disk under buyer_agent/keys/. Adds a per-request Ed25519 "
+            "signature verified BEFORE the spend-cap/stock gate runs -- see merchant_service/mandate.py."
+        ),
+    )
+    if not usable_mandates:
+        st.caption(f"No usable mandate found for `{agent_id}`. Run `python3 db/generate_agent_keys.py` first.")
+
+    selected_mandate_id = None
+    tamper_signature = False
+    if use_mandate and usable_mandates:
+        mandate_labels = {
+            f"{m['mandate_id']}  (cap ₹{m['max_amount']:,.0f}, expires {m['expires_at']})": m["mandate_id"]
+            for m in usable_mandates
+        }
+        chosen_label = st.selectbox("Mandate", list(mandate_labels.keys()), key="chosen_mandate_label")
+        selected_mandate_id = mandate_labels[chosen_label]
+        tamper_signature = st.checkbox(
+            "😈 Tamper with signature after signing (demonstrate invalid_signature decline)",
+            key="tamper_signature",
+        )
+
     with st.form("run_agent_form"):
         col1, col2 = st.columns(2)
-        agent_id = col1.selectbox("Agent", ["agent_high", "agent_low"])
+        col1.markdown(f"**Agent:** `{agent_id}`" + (f" · **Mandate:** `{selected_mandate_id}`" if selected_mandate_id else ""))
         quantity = col2.number_input("Quantity", min_value=1, value=1)
         simulate_failure = st.checkbox("Simulate Razorpay infra failure")
         confirm_custom = st.checkbox("I understand this will fire a real purchase request")
@@ -173,7 +256,14 @@ with tab_run_agent:
             if not confirm_custom:
                 st.warning("Please confirm before running a real purchase.")
             else:
-                result = api.run_agent_flow(selected_product_id, int(quantity), agent_id, simulate_failure)
+                result = api.run_agent_flow(
+                    selected_product_id,
+                    int(quantity),
+                    agent_id,
+                    simulate_failure,
+                    mandate_id=selected_mandate_id,
+                    tamper_signature=tamper_signature,
+                )
                 st.session_state["last_run_result"] = result
                 st.rerun()
 
@@ -189,6 +279,8 @@ with tab_run_agent:
             status_row = st.container()
             status_row.markdown("**Status:**")
             render_status_badge(status_row, txn.get("status"))
+            if result.get("mandate_id"):
+                st.caption(f"🔐 Signed with delegated mandate `{result['mandate_id']}` (Ed25519, verified server-side).")
             if idempotent:
                 st.info("This was an idempotent duplicate — no new transaction was created.")
             st.json(txn)
@@ -201,6 +293,96 @@ with tab_run_agent:
                             render_audit_trail(st, trail)
                 except Exception as e:
                     st.caption(f"(Could not load audit trail inline: {e}. Try the 🔍 Audit Trail tab.)")
+
+# ---------------------------------------------------------------------------
+# Mandates view (AP2-inspired delegated payment authorization)
+# ---------------------------------------------------------------------------
+with tab_mandates:
+    st.subheader("Delegated Payment Mandates")
+    st.caption(
+        "A mandate is the principal's one-time, Ed25519-signed authorization binding a specific "
+        "agent keypair to a spending scope (max amount, currency, expiry). Every mandate-backed "
+        "purchase is then signed per-request by the agent's own private key and verified here "
+        "server-side, BEFORE the spend-cap/stock gate runs — see merchant_service/mandate.py."
+    )
+
+    agent_filter = st.selectbox("Filter by agent", ["(all agents)", "agent_high", "agent_low"], key="mandate_agent_filter")
+    filter_agent_id = None if agent_filter == "(all agents)" else agent_filter
+
+    try:
+        mandates = api.get_mandates(filter_agent_id)
+    except Exception as e:
+        mandates = None
+        st.error(f"Could not reach merchant service: {e}")
+
+    if mandates is not None:
+        if not mandates:
+            st.info(
+                "No mandates found for this filter. Run `python3 db/generate_agent_keys.py` from a "
+                "terminal to issue one per seeded agent."
+            )
+        for m in mandates:
+            usable = mandate_is_usable(m)
+            has_key = api.has_local_agent_key(m["agent_id"])
+            cols = st.columns([2, 1.3, 1, 1.4, 1.3])
+            cols[0].markdown(f"`{m['mandate_id']}`  \nagent: `{m['agent_id']}`")
+            cols[1].markdown(f"cap: ₹{m['max_amount']:,.0f} {m['currency']}")
+            cols[2].markdown("🔴 revoked" if m["revoked"] else ("🟢 active" if usable else "⏱️ expired"))
+            cols[3].markdown(f"expires:  \n{m['expires_at']}")
+            revoke_disabled = bool(m["revoked"])
+            if cols[4].button("Revoke", key=f"revoke_{m['mandate_id']}", disabled=revoke_disabled):
+                try:
+                    api.revoke_mandate(m["mandate_id"])
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not revoke: {e}")
+            if usable and not has_key:
+                st.caption(
+                    f"⚠️ No local private key found at `buyer_agent/keys/{m['agent_id']}.key` — "
+                    "signing from this dashboard will fail even though the mandate itself is valid."
+                )
+            with st.expander(f"🔍 Signed binding payload for `{m['mandate_id']}`"):
+                st.json({
+                    "agent_id": m["agent_id"],
+                    "agent_public_key": m["agent_public_key"],
+                    "principal_id": m["principal_id"],
+                    "principal_public_key": m["principal_public_key"],
+                    "principal_signature (masked)": api.mask_signature(m["principal_signature"]),
+                    "max_amount": m["max_amount"],
+                    "currency": m["currency"],
+                    "issued_at": m["issued_at"],
+                    "expires_at": m["expires_at"],
+                })
+            st.divider()
+
+    st.subheader("Mandate-Signed Purchase Attempts")
+    st.caption(
+        "Every purchase request that carried a mandate_id, whether the Ed25519 signature verified "
+        "or not — including attempts that never became a transaction at all, like a revoked mandate "
+        "or a tampered signature. Signatures are shown masked here for readability; the merchant "
+        "verified the full value server-side regardless of what's displayed."
+    )
+    outcome_filter = st.selectbox("Filter by outcome", ["(all)", "✅ success", "❌ failed"], key="mandate_attempt_outcome_filter")
+    valid_param = {"✅ success": True, "❌ failed": False}.get(outcome_filter)
+
+    try:
+        attempts = api.get_mandate_attempts(agent_id=filter_agent_id, valid=valid_param)
+    except Exception as e:
+        attempts = None
+        st.error(f"Could not reach merchant service: {e}")
+
+    if attempts is not None:
+        if not attempts:
+            st.info("No mandate-signed purchase attempts yet for this filter.")
+        for a in attempts:
+            cols = st.columns([1.6, 1, 1, 1.6, 1.3, 1.8])
+            cols[0].markdown(f"`{a['mandate_id']}`  \nagent: `{a['agent_id']}`")
+            cols[1].markdown(f"₹{a['amount']:,.0f}")
+            cols[2].markdown("✅ valid" if a["valid"] else "❌ invalid")
+            cols[3].markdown(f"reason:  \n`{a['reason']}`")
+            cols[4].markdown(f"txn: `{a['txn_id']}`" if a["txn_id"] else "— (no txn)")
+            cols[5].markdown(f"sig: `{api.mask_signature(a['signature'])}`  \n🕒 {a['created_at']}")
+        st.divider()
 
 # ---------------------------------------------------------------------------
 # Transactions view

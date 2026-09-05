@@ -121,3 +121,32 @@ CREATE TABLE IF NOT EXISTS mandates (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mandates_agent_id ON mandates (agent_id);
+
+-- ---------------------------------------------------------------------------
+-- mandate_attempts
+--
+-- Records EVERY purchase request that carried a mandate_id, whether the
+-- signature verified or not. This exists as its own table (rather than
+-- relying on audit_log alone) because a failed mandate check happens
+-- inside main.py's BEGIN IMMEDIATE block and everything else in that
+-- block gets rolled back -- without a dedicated, independently-committed
+-- record, failed mandate attempts would leave zero trace anywhere. This
+-- is what the dashboard's Mandates tab reads to show a per-agent
+-- success/failure history.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mandate_attempts (
+    attempt_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    mandate_id  TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    quote_id    TEXT NOT NULL,
+    txn_id      TEXT,  -- NULL when verification failed before a transaction row could exist
+    amount      REAL NOT NULL,
+    valid       INTEGER NOT NULL CHECK (valid IN (0, 1)),
+    reason      TEXT NOT NULL,  -- e.g. "ok", "invalid_signature", "mandate_revoked", "mandate_expired"
+    signature   TEXT NOT NULL,  -- hex-encoded Ed25519 signature, stored in full; the dashboard masks it on display
+    signed_at   TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mandate_attempts_agent_id ON mandate_attempts (agent_id);
+CREATE INDEX IF NOT EXISTS idx_mandate_attempts_mandate_id ON mandate_attempts (mandate_id);

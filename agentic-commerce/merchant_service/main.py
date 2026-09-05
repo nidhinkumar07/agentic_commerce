@@ -205,8 +205,32 @@ def purchase(req: PurchaseRequest, x_agent_secret: Optional[str] = Header(None))
                 mandate_result.to_dict(),
                 conn=conn,
             )
+            # Also record it in mandate_attempts (a table separate from
+            # audit_log -- see schema.sql) so a FAILED attempt survives
+            # even though everything else in this DB block is about to be
+            # rolled back. txn_id is filled in later via
+            # link_mandate_attempt_txn() once a real transaction exists;
+            # for a failed attempt, no transaction is ever created, so it
+            # stays NULL -- which is itself meaningful in the dashboard.
+            db.log_mandate_attempt(
+                mandate_id=req.mandate_id,
+                agent_id=req.agent_id,
+                quote_id=req.quote_id,
+                amount=quote["total_price"],
+                valid=mandate_result.valid,
+                reason=mandate_result.reason,
+                signature=req.signature,
+                signed_at=req.signed_at,
+                conn=conn,
+            )
             if not mandate_result.valid:
-                conn.execute("ROLLBACK")
+                # COMMIT, not ROLLBACK: nothing has been written in this
+                # block yet except the two log rows above (no quote was
+                # consumed, no transaction or stock touched), so this
+                # persists the failed mandate attempt without persisting
+                # anything else. The endpoint still aborts via the
+                # exception below either way.
+                conn.execute("COMMIT")
                 raise HTTPException(
                     status_code=403,
                     detail=f"mandate verification failed: {mandate_result.reason}",
@@ -238,6 +262,12 @@ def purchase(req: PurchaseRequest, x_agent_secret: Optional[str] = Header(None))
                 {"decision": "declined", "reason": result.reason, "checked_amount": quote["total_price"] if quote else None},
                 conn=conn,
             )
+            if req.mandate_id:
+                # Mandate verification passed (that's the only way to reach
+                # this branch with a mandate_id set) but the gate itself
+                # still declined -- e.g. stock or spend-cap. Link the
+                # already-logged mandate_attempts row to this real txn_id.
+                db.link_mandate_attempt_txn(req.mandate_id, req.quote_id, req.signed_at, txn["txn_id"], conn=conn)
             conn.execute("COMMIT")
             return {"idempotent": False, "transaction": txn}
 
@@ -265,6 +295,7 @@ def purchase(req: PurchaseRequest, x_agent_secret: Optional[str] = Header(None))
                 {"valid": True, "reason": "ok", "mandate_id": req.mandate_id},
                 conn=conn,
             )
+            db.link_mandate_attempt_txn(req.mandate_id, req.quote_id, req.signed_at, txn["txn_id"], conn=conn)
 
         txn = db.update_transaction_status(txn["txn_id"], "approved", conn=conn)
         db.log_audit(
@@ -382,6 +413,59 @@ def get_audit(txn_id: str):
 @app.get("/transactions")
 def get_transactions(status: Optional[str] = None):
     return db.list_transactions(status=status)
+
+
+@app.get("/mandates")
+def get_mandates(agent_id: Optional[str] = None):
+    """
+    Lists delegated-payment mandates (see merchant_service/mandate.py),
+    optionally filtered by agent_id. Read-only -- issuing a mandate is
+    still exclusively db/generate_agent_keys.py's job (that's where the
+    PRINCIPAL signs the binding), so this endpoint has no POST/PUT
+    counterpart. Used by the dashboard to let a user pick a real,
+    currently-valid mandate instead of pasting a mandate_id by hand.
+    """
+    return db.list_mandates(agent_id=agent_id)
+
+
+@app.get("/mandate-attempts")
+def get_mandate_attempts(agent_id: Optional[str] = None, mandate_id: Optional[str] = None, valid: Optional[bool] = None):
+    """
+    Lists every purchase request that carried a mandate_id, success or
+    failure -- see db/schema.sql's mandate_attempts table for why this
+    needs to be its own table rather than derived from audit_log or
+    transactions (a failed mandate check never creates a transaction
+    row at all). Returns the signature in full; the dashboard masks it
+    for display (see dashboard/api_client.mask_signature) -- this
+    endpoint itself doesn't redact anything, since a real client of this
+    API might legitimately need the full value for its own diagnostics.
+    """
+    return db.list_mandate_attempts(agent_id=agent_id, mandate_id=mandate_id, valid=valid)
+
+
+@app.post("/mandates/{mandate_id}/revoke")
+def revoke_mandate(mandate_id: str):
+    """
+    Revokes a mandate so it can no longer be used to sign purchases --
+    mandate.verify_purchase_mandate() checks this flag before anything
+    else. This is a merchant/principal-side action (not something an
+    agent can do to itself), included so the dashboard can demonstrate
+    the 'mandate_revoked' decline path live instead of only in
+    tests/test_mandate.py.
+    """
+    conn = db.get_connection()
+    try:
+        row = conn.execute("SELECT * FROM mandates WHERE mandate_id = ?", (mandate_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"mandate '{mandate_id}' not found")
+        conn.execute("UPDATE mandates SET revoked = 1 WHERE mandate_id = ?", (mandate_id,))
+        conn.commit()
+        updated_row = conn.execute(
+            "SELECT * FROM mandates WHERE mandate_id = ?", (mandate_id,)
+        ).fetchone()
+        return dict(updated_row)
+    finally:
+        conn.close()
 
 
 @app.get("/metrics")
